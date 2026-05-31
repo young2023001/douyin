@@ -1,0 +1,275 @@
+---
+name: douyin-comment
+description: 抖音评论 CLI — 作品列表 / 搜索视频 / 获取评论(含嵌套回复) / 发表回复评论。CDP daemon 生命周期自动管理。
+---
+
+# 抖音评论 Skill
+
+## 前置条件
+
+- 用户已打开 Chrome 并**登录抖音**
+- Chrome 已启用 `chrome://inspect/#remote-debugging` 开关
+- 依赖已安装：`cd skill-douyin && npm install`
+
+## 通用选项
+
+所有命令均支持以下选项：
+
+| 选项 | 作用 |
+|------|------|
+| `--raw` | 输出完整 API 原始 JSON（调试用） |
+| `--no-log` | 本次执行不写入审计日志 |
+
+## Daemon 生命周期（关键）
+
+**一个 session 只启动一次 daemon。代理必须严格管理其生命周期。**
+
+```
+操作顺序: daemon → 探活 → 操作... → stop
+                └─ 失败则重启 ─┘
+```
+
+### 启动
+
+```bash
+cd <项目根目录> && node cli.js daemon
+```
+
+用 `run_background` 运行，等待输出 `[daemon] Listening on http://127.0.0.1:19422` 表示就绪。
+
+首次连接时 Chrome 会弹出"允许调试"对话框，**通知用户点击一次"允许"**。后续不会再弹。
+
+> 如果输出 `Daemon already running.`，说明已有存活 daemon，直接继续。
+
+### 每次操作前探活
+
+```bash
+node cli.js ping
+```
+
+- 输出 `pong` → daemon 正常，继续操作
+- 输出 `Daemon not running` 或超时 → **重新执行启动步骤**
+
+### 操作完毕停止
+
+```bash
+node cli.js stop
+```
+
+**必须执行。** 否则 daemon 占用内存，20 分钟无活动自动退出也不应依赖。
+
+---
+
+## 命令参考
+
+### 我的作品
+
+```bash
+node cli.js my
+node cli.js my --count 30
+```
+
+输出（清洁模式）：
+```json
+[{
+  "aweme_id": "7629735841874726179",
+  "desc": "视频描述前80字...",
+  "time": 1780238354,
+  "stats": { "plays": 1234, "likes": 56, "comments": 12, "shares": 3 }
+}]
+```
+
+### 搜索视频
+
+```bash
+node cli.js search "周杰伦"
+node cli.js search "周杰伦" --offset 10 --count 20
+```
+
+输出：
+```json
+[{
+  "aweme_id": "7533234103531261243",
+  "desc": "视频描述...",
+  "author": "瓶妞Lottie英语",
+  "uid": "83925411173",
+  "time": 1754007300,
+  "plays": 0
+}]
+```
+
+### 获取评论
+
+```bash
+node cli.js get 7629735841874726179                  # 默认 1 页 20 条
+node cli.js get 7629735841874726179 --pages 5        # 指定页数
+node cli.js get 7629735841874726179 --all             # 全部一级评论
+node cli.js get 7629735841874726179 --all --depth 1   # 含嵌套回复
+node cli.js get 7629735841874726179 --new             # 增量：只拉上次获取之后的新评论
+node cli.js get 7629735841874726179 --new --depth 1   # 增量 + 嵌套回复
+node cli.js get 7629735841874726179 --since 1780238354  # 增量：指定 Unix 时间戳
+```
+
+输出（`--depth 1` 时有 `children`）：
+```json
+[{
+  "cid": "7646...",
+  "text": "一级评论内容",
+  "likes": 1,
+  "replies": 3,
+  "time": 1780238354,
+  "user": { "nickname": "用户", "uid": "123", "avatar": "https://..." },
+  "children": [{
+    "cid": "7647...",
+    "text": "回复内容",
+    "likes": 0,
+    "replies": 0,
+    "time": 1780239000,
+    "user": { "nickname": "回复者", "uid": "456", "avatar": "https://..." }
+  }]
+}]
+```
+
+- `--depth 1`：拉所有一级评论 + 每条下所有回复
+- `--depth 2`：递归两层（回复的回复）
+
+#### 增量获取（`--new` / `--since`）
+
+基于时间戳过滤，只拉取新评论，请求数最少。
+
+**`--new`**：自动从审计日志中找到该视频上次成功 `get` 的时间，只拉此后的新评论。无历史记录时退化为全量。
+
+**`--since <unix_ts>`**：显式指定 Unix 时间戳（秒），只拉 `create_time > ts` 的评论。
+
+```bash
+# 首次全量
+node cli.js get 7629735841874726179 --all --depth 1
+
+# 后续增量（通常只需 1 次请求）
+node cli.js get 7629735841874726179 --new --depth 1
+```
+
+**原理**：从 `cursor=0` 逐页拉取，每页过滤 `create_time > cutoff`，遇到旧评论立即停止。通常 1-2 次请求即可完成。
+
+### 单条回复列表
+
+```bash
+node cli.js replies <cid> <aweme_id>
+```
+
+输出格式同 `get` 的结果项（无 `children`）。
+
+### 查看操作日志
+
+```bash
+node cli.js log                              # 最近 10 条操作
+node cli.js log --tail 20                    # 最近 20 条
+node cli.js log --video <aweme_id>           # 指定视频的所有操作
+node cli.js log --failed                     # 只看失败的
+```
+
+输出示例：
+```
+✅ [2026-05-31T21:13:04] get {"aweme_id":"7259245704948747575","mode":"all","depth":1} 25.0s
+   result: logs/results/get-7259245704948747575-20260531T211304.json
+   summary: {"comments":200,"pages":10}
+✅ [2026-05-31T21:15:00] post {"aweme_id":"7259245704948747575","text":"好看！"} 1.2s
+   result: {"cid":"7648...","text":"好看！","status":"published"}
+```
+
+### 发表评论
+
+```bash
+node cli.js post 7629735841874726179 "好看！"
+node cli.js post 7629735841874726179 "说得对" --reply-to 7646065507817734949
+```
+
+输出：
+```json
+{ "cid": "7646...", "text": "好看！", "time": 17802..., "status": "published" }
+```
+
+失败：
+```json
+{ "error": "status_code=8" }
+```
+
+> **注意**：评论内容中的引号会被自动转义。`status_code=8` 通常表示内容过短、重复或被风控拦截，换内容重试。
+
+---
+
+## 智能回复工作流
+
+配合策略文件 `reply-strategy.md`，agent 可自动判断哪些评论需要回复、生成回复内容并发布。
+
+### 首次执行
+
+```
+1. 读取策略文件（reply-strategy.md）
+2. node cli.js get <aweme_id> --all --depth 1
+3. 根据策略逐条判断：
+     → 跳过 → 记录原因
+     → 需回复 → 根据风格指南生成回复内容
+              → node cli.js post <aweme_id> "内容" --reply-to <cid>
+4. 输出执行报告
+```
+
+### 后续增量执行
+
+```
+1. 读取策略文件
+2. node cli.js get <aweme_id> --new --depth 1   # 只拉新评论
+3. 对新评论逐条判断并回复
+4. 输出执行报告（标注增量模式 + 跳过旧评论数）
+```
+
+> `--new` 自动从审计日志中找到上次拉取时间，通常只需 1-2 次 API 请求。
+
+### 策略文件
+
+项目根目录 `reply-strategy.md` 包含完整策略模板：优先回复规则、跳过条件、风格指南、限制参数、特殊需求占位区。每次使用前可根据场景编辑"特殊需求"部分。
+
+### 限制遵循
+
+agent 在执行时必须遵守策略中的硬限制：
+- 每视频最多回复 30 条：达到上限立即停止
+- 同一用户不重复回复：不回复自己或已回复过的评论
+- 连续 5 条不匹配则停止：避免无效遍历
+
+---
+
+## 故障排查
+
+| 症状 | 原因 | 解法 |
+|------|------|------|
+| `Daemon not running` | daemon 进程不存在 | 重新启动 daemon |
+| daemon 启动后输出 `Daemon already running.` | 上次未 stop | 先 `stop` 再 `daemon`，或直接用 |
+| `No Douyin page found` | 浏览器未打开抖音页面 | 通知用户在 Chrome 中打开 `douyin.com` 任意视频页 |
+| Chrome 弹"允许调试" | 首次连接此 tab | 通知用户点击"允许"，仅需一次 |
+| `status_code=8` | 评论被拦截 | 换内容重试（更长/更自然） |
+| 搜索/获取返回空数组 `[]` | daemon 未加载新 bridge | `stop` → `daemon` 重启 |
+| `Cannot connect to Chrome` | Chrome 调试开关未开 | 通知用户打开 `chrome://inspect/#remote-debugging` |
+| daemon 启动报 `Daemon already running.` 但实际已死 | PID 文件残留（上次异常退出） | 手动删除 `.douyin_daemon.pid` 后重启 |
+| daemon 中途无响应 | CDP 连接断开且无自动重连 | `stop` → `daemon` 重启 |
+| `--new` 无历史记录仍拉全量 | 该视频未被拉取过 | 预期行为，首次执行 `--new` 等价于 `--all` |
+
+---
+
+## 审计日志
+
+所有 CLI 操作自动记录到 `logs/audit.json`，便于追踪和增量拉取。
+
+```
+logs/
+├── audit.json              ← 操作元数据（sessions → operations → apiCalls）
+└── results/
+    ├── get-<aweme_id>-<ts>.json    ← 评论获取的完整结果
+    ├── search-<kw>-<ts>.json       ← 搜索结果
+    └── ...
+```
+
+- 每个操作记录：命令、参数、开始/结束时间、耗时、成功/失败、摘要
+- 每个 API 调用记录：端点、参数、耗时、返回条数
+- 大结果（`get`/`search`/`my`/`replies`）落地为独立 JSON 文件
+- 小结果（`post`/`ping`/`stop`）内联在 audit.json
+- `--no-log` 可跳过记录
